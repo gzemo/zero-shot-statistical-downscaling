@@ -4,25 +4,69 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-#import torch
-#import torch.nn.functional as F
-#from torch.utils.data import Dataset
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
-#import torchvision
-#import torchvision.transforms as tt
-#import torchvision.transforms.functional as ttf
+import torchvision
+import torchvision.transforms as tt
+import torchvision.transforms.functional as ttf
 
-#from thop import profile
+from thop import profile
 from pyhdf.SD import SD, SDC
  
 from quality_assessment import init_qc_table
 
-
-#DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SF = 0.02
-THRESHOLD =?????
+THRESHOLD = 0.01
 
+
+class Mask_AvgPool2d(torch.nn.Module):
+	""" Custom AvgPool2D layer meant to be used while imputing missing data:
+	if zeros are involved over the considered spatial kernels, the averaged
+	output will neglect them """
+	def __init__(self, kernel_size, stride, padding):
+		super(Mask_AvgPool2d, self).__init__()
+		self.kernel_size = torch.nn.modules.utils._pair(kernel_size)
+		self.stride      = torch.nn.modules.utils._pair(stride)
+		self.padding     = torch.nn.modules.utils._quadruple(padding)
+
+	def _masked_avg(self, x):
+		""" Custom avg """
+		# Masked mean (excluding zeros)
+
+		x = torch.where(x==0, x[x!=0].mean(), x)
+		m = x.mean(-1)
+		if m.isnan().any().item():
+		    m = torch.where(m.isnan(), 0, m).mean(-1)
+		return m
+
+	def forward(self, x):
+		#x = x.to(DEVICE) # check this that may not work while using cuda11.6
+		h, w = x.shape[-2], x.shape[-1]
+
+		#if len(x.shape) == 3:
+		#    _, h, w = x.shape
+		#elif len(x.shape) == 4:
+		#    _, _, h, w = x.shape
+		#else:
+		#    raise ValueError(f" Shape must be [b,c,h,w] or [c,h,w]: found n.dim ({len(x.shape)}")
+
+		x = x.reshape(1, 1, h, w) if len(x.shape)!=4 else x
+
+		x = ttf.pad(x, tuple([(self.kernel_size[0]-1)//2]*4), padding_mode='reflect')
+		x = x.unfold(2, self.kernel_size[0], self.stride[0]).unfold(3, self.kernel_size[1], self.stride[1])
+		x = x.contiguous().view(x.size()[:4] + (-1,))
+		pool = self._masked_avg(x).squeeze(0)
+		return pool.to("cpu")
+    
 class DataFilter():
+	"""
+	Example usage
+	datafilter =  DataFilter("lr-file-to-path", "hr-file-to-path", 0.1)
+	datafilter.scan_all()
+	"""
 	def __init__(self, lr_filepath:str, hr_filepath:str, cloud_coverage:float):
 		
 		self.lr_filepath = lr_filepath
@@ -33,13 +77,9 @@ class DataFilter():
 			 if item.endswith(".hdf")]
 		self.lr_layers = ["LST_Day_6km", "LST_Night_6km"]
 		self.hr_layers = ["LST_Day_1km", "LST_Night_1km"]
-
 		self.cloud_coverage = cloud_coverage
-
 		self.merged_df = None
-
 		self.qc_table = init_qc_table()
-
 
 	@staticmethod
 	def _read_rescale_data(filepath, layername, sf):
@@ -50,8 +90,7 @@ class DataFilter():
 			sf: (float) scale factor
 		"""
 		data = SD(filepath, SDC.READ)
-		print("Hardcoded!")
-		data = np.array(data.select(layername)[:,:].astype(np.float32))
+		data = torch.Tensor(data.select(layername)[:,:].astype(np.float32))
 		return data * sf
 
 	@staticmethod
@@ -59,7 +98,7 @@ class DataFilter():
 		""" Return QC layer
 		"""
 		data = SD(filepath, SDC.READ)
-		data = np.array(data.select(layername)[:,:].astype(np.int64))
+		data = torch.Tensor(data.select(layername)[:,:].astype(np.int64))
 		return data
 
 	@staticmethod
@@ -71,13 +110,11 @@ class DataFilter():
 		"""
 		cloud_perc, error_perc = 0., 0.
 	 
-		# define quality values to be excluded
+		# Define quality values to be excluded and Temperature Error
 		nopixels = ("No Pixel,clouds", "No Pixel, Other QA")
-
-		# define Temperature error to be excluded from no-cloud filtered QA_Data
 		noerrors = ("LST Err > 3K",)
 
-		# filter Full 8-bit QC_Data according to current tile
+		# Filter Full 8-bit QC_Data according to current tile
 		tile = tile.flatten()
 		current_values = pd.unique(tile)
 		QC_Data_current = QC_Data[QC_Data.Integer_Value.isin(current_values)]\
@@ -96,8 +133,6 @@ class DataFilter():
 
 		# Estimate percentage Temperature errors of non clouds data
 		for noerror in noerrors:
-			#try: print((filtered.groupby("LST_Err")["Integer_Value"].count()/filtered.shape[0])[noerror])
-			#except: print("notfound")
 			error_perc += (filtered.groupby("LST_Err")["Integer_Value"].count() / filtered.shape[0])[noerror]\
 				if noerror in filtered.LST_Err.unique() \
 				else 0.
@@ -106,10 +141,12 @@ class DataFilter():
 
 	@staticmethod
 	def _estimate_zerofilled(tile):
-		return round((tile==0).mean(), 6)
+		return (tile==0).float().mean().item()
 
 
 	def merge_datasets(self):
+		""" Combine scanning datasets from LR and HR sets
+		"""
 		dfs = []
 		for res in ["lr", "hr"]:
 			file_list = self.lr_list if res == "lr" else self.hr_list
@@ -123,6 +160,9 @@ class DataFilter():
 
 
 	def scan_all(self):
+
+		if os.path.exists("./scanning_paired_dataset.csv"):
+			return
 
 		self.merged_df = self.merge_datasets()
 
@@ -163,7 +203,7 @@ class DataFilter():
 		self.merged_df.to_csv("./scanning_paired_dataset.csv")
 
 
-
+# Actually no more useful!
 class SubTilesCoords():
 	def __init__(self, lr_data_shape, hr_data_shape, 
 		lr_subtile_size, hr_subtile_size):
@@ -194,7 +234,7 @@ class SubTilesCoords():
 					subtiles.append((coord_h[0], coord_h[1], coord_w[0], coord_w[1]))
 
 			# store info
-			self._subtiles_coords[k]["tiles_h"] = tiles_h # consider to remove this 
+			self._subtiles_coords[k]["tiles_h"] = tiles_h # consider to remove 
 			self._subtiles_coords[k]["tiles_w"] = tiles_w
 			self._subtiles_coords[k]["tiles_n"] = subtiles
 
@@ -202,9 +242,8 @@ class SubTilesCoords():
 		return self._subtiles_coords
 
 
-print("Hardcoded!")
-#class MODIS_dataset(Dataset):
-class MODIS_dataset():
+
+class MODIS_dataset(Dataset):
 
 	def __init__(self,
 		lr_filepath,
@@ -237,6 +276,7 @@ class MODIS_dataset():
 
 		# Subpatches sizes
 		self.patch_size = 64
+
 		#self.lr_data_shape = (1, self.lr_subtile_size*4, self.lr_subtile_size*4)
 		#self.hr_data_shape = (1, self.hr_subtile_size*4, self.hr_subtile_size*4)
 
@@ -247,16 +287,16 @@ class MODIS_dataset():
 		# Flag to allow augmentation (enable only while training)
 		self.transforms = True if data_set == "train" else False
 		self.kernel_size = kernel_size
-		self.train_params = train_params
+		self.train_params = pd.read_csv(train_params)
 
 		self.lr_layer_spec_name = "6km"
 		self.hr_layer_spec_name = "1km"
 
 		# Initialize padding layer:
 		print("Hardcoded!") # should be enable to be a valid torch instance
-		#self.average_pooling = Mask_AvgPool2d(self.kernel_size, stride=1, padding=self.kernel_size//2).to(DEVICE)
+		self.average_pooling = Mask_AvgPool2d(self.kernel_size, stride=1, padding=self.kernel_size//2).to(DEVICE)
 
-		# Filtering according to thresholds
+		# Filtering QA table according to thresholds
 		self.qa = pd.read_csv(qa)
 		self.qa = self.qa.loc[
 			(self.qa.lr_Day_zero_filled < self.zerof_thr) & \
@@ -313,40 +353,47 @@ class MODIS_dataset():
 		return data * sf
 
 	@staticmethod
-    def _get_outlier_map(data, nstd):
-        """ Return map of outliers values according to a given nstd
-        Args:
-            nstd: (int) number of standard dev outlier threshold
-        """
-        condition = (data < (data.mean() - nstd*data.std())) | (data > (data.mean() + nstd*data.std()))
-        return torch.where(condition, 1, 0)
+	def _get_outlier_map(data, nstd):
+		""" Return map of outliers values according to a given nstd
+		Args:
+		nstd: (int) number of standard dev outlier threshold
+		"""
+		condition = (data < (data.mean() - nstd*data.std())) | (data > (data.mean() + nstd*data.std()))
+		outlier_map = torch.where(condition, 1, 0)
+        
+		# Check dimension
+		outlier_map = outlier_map.unsqueeze(0) if len(outlier_map.shape) < 3 else outlier_map
+                    
+		return outlier_map
 
 
 	def get_train_params(self, res, tiles):
 		""" Return the mean and variance of the corresponding train subset
 		filtered by the given res and tiles
 		"""
-		tiles = tiles[3:6]+tiles[0:3]
-		train_mean, train_var = self.train_params[(self.train_params.res == res) &\
-			(self.train_params.tiles == tiles)]\
-			[["train_mean", "train_var"]]
+		# Convert tile format vXXhXX to hXXvXX
+		params = self.train_params[(self.train_params.res == res) &\
+			(self.train_params.tiles == tiles)][["train_mean", "train_var"]].values[0]
+		train_mean, train_var = params[0], params[1]
 
 		return train_mean, train_var
 
 
 	def crop_subpatch(self, lr_data, hr_data):
-		""" Return LR interpolated to match HR size, HR and invalid mask
+		""" Return Random Cropped LR interpolated to match HR size, HR and invalid mask
 		Args:
 			lr_data: (torch.Tensor) lr data already interpolated to match HR size
 			hr_data: (torch.Tensor) hr data
 		"""
 		# Merge data and perform random cropping
+               
 		data = torch.cat([lr_data, hr_data], 1)
+        
 		subpatch = tt.Compose([tt.RandomCrop((self.patch_size, self.patch_size))])(data)
-		lr_subpatch, hr_subpatch = subpatch[0,0,:,:], subpatch[0,1,:,:]
-		
-		# Estimate binary mask for invalid values
-		valid_mask = subpatch.all(1).int()
+		lr_subpatch, hr_subpatch = subpatch[:,0,:,:], subpatch[:,1,:,:]
+        
+		# Estimate binary mask for valide / invalid values
+		valid_mask = torch.cat([lr_subpatch, hr_subpatch], 0).all(0).int().unsqueeze(0)
 		invalid_mask = torch.abs(valid_mask - 1).int()
 
 		# Check dimension!!!
@@ -354,9 +401,8 @@ class MODIS_dataset():
 
 
 	def yield_subpatch(self, lr_data, hr_data):
-
 		# Interpolate with NN to match HR dimension
-		lr_data = F.interpolate(lr_data, up_scale=self.up_scale, mode="nearest-exact")
+		lr_data = F.interpolate(lr_data, scale_factor=self.up_scale, mode="nearest-exact")
 
 		lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
@@ -371,7 +417,7 @@ class MODIS_dataset():
 		Iterative update by imputing data over a given kernel_size
 		"""
 		# If no missing value
-		if torch.all(data).item():
+		if data.all().item():
 			return data
 
 		# Estimate percentage of zero-filled pixels
@@ -382,7 +428,7 @@ class MODIS_dataset():
 		while zerofilled_perc > filled_thr and patience < max_patience:
 
 			# Estimate current binary masks
-			tmp_valid_mask = data.all().int()
+			tmp_valid_mask = data.all(0).int()
 			tmp_invalid_mask = torch.abs(tmp_valid_mask - 1)
 
 			# Fill missing coordinates
@@ -400,8 +446,6 @@ class MODIS_dataset():
 		""" Kernel based interpolation (via Torch.nn.Module)
 		Iterative update by imputing data over a given kernel_size
 		"""
-		avg_map = self.average_pooling(data)
-		#avg_map = data.mean()
 
 		init_outlier_map = self._get_outlier_map(data, nstd)
 		outlier_map = init_outlier_map.clone()
@@ -409,7 +453,8 @@ class MODIS_dataset():
 		# If no missing value
 		if torch.abs(outlier_map - 1).all().item():
 			return data, init_outlier_map.int()
-
+        
+		avg_map = self.average_pooling(data)
 		patience = 0
 
 		# Estimate percentage of outliers pixels
@@ -418,6 +463,7 @@ class MODIS_dataset():
 		# Loop until all values had been imputed
 		while not torch.abs(outlier_map - 1).all() and patience < max_patience:
 
+			# Impute outlier with spatial mean
 			data = torch.where(outlier_map.bool(), avg_map, data)
 
 			# Update criteria
@@ -428,16 +474,26 @@ class MODIS_dataset():
 		return data, init_outlier_map.int()
 
 
-	def normalise(self, data, res, tiles):
+	def normalise_tilebased(self, data, res, tiles):
 		""" Standardize image value according to intra-tiles mean
 		"""
-		train_mean, train_var = self._get_train_params(res, tiles)
-		data = torch.divide((data-train_mean), torch.sqrt(train_var))
+		train_mean, train_var = self.get_train_params(res, tiles)
+		data = (data - train_mean) / np.sqrt(train_var); print(data.shape, type(data))
 		return data
-
+    
+	def normalise_subpatchbased(self, lr_data, hr_data):
+		""" Standardize image value according to the current LR-HR sub-patch mean
+		"""
+		merged_data = torch.cat([lr_data, hr_data], 0)
+		mmean, mstd = merged_data[merged_data!=0].mean(), merged_data[merged_data!=0].std()
+		lr_data = (lr_data - mmean) / mstd
+		hr_data = (hr_data - mmean) / mstd
+		return lr_data, hr_data  
 
 
 	def __getitem__(self, idx):
+		"""Yield {LR, HR, invalid_pixels_mask} 
+		"""
 
 		pair = dict()
 		curr_line = self.qa_reshufle.iloc[idx]
@@ -450,30 +506,34 @@ class MODIS_dataset():
 			curr_path = self.lr_filepath if res == "lr" else self.hr_filepath
 			curr_filename = curr_line[f"{res}_files"]
 			spec_name = self.lr_layer_spec_name if res == "lr" else self.hr_layer_spec_name
-			curr_layer = f"LST_{layer}_{spec_name}" 
+			curr_layer = f"LST_{layer}_{spec_name}"
+			print( os.path.join(curr_path, curr_filename))
 
 			# Load data
 			pair[res] = self._read_rescale_data(os.path.join(curr_path, curr_filename), curr_layer, SF)
 
 		# Iterate until a valid mask is given
 		lr_subpatch, hr_subpatch, invalid_mask = self.yield_subpatch(pair["lr"], pair["hr"])
-
+        
 		# Impute missing for both LR and HR
 		lr_subpatch = self.impute_missing(lr_subpatch, invalid_mask)
 		hr_subpatch = self.impute_missing(hr_subpatch, invalid_mask)
 
-		# Impute outliers
+		# Impute outliers (tile-based approach)
 		lr_subpatch, lr_outlier_mask = self.impute_outliers(lr_subpatch)
 		hr_subpatch, hr_outlier_mask = self.impute_outliers(hr_subpatch)
 
 		# Merge invalid masks
-		invalid_mask = torch.cat([invalid_mask, lr_outlier_mask, hr_outlier_mask], 1).all(1)
+		#invalid_mask = torch.cat([invalid_mask, lr_outlier_mask, hr_outlier_mask], 0).any(0).unsqueeze(0)
+		invalid_mask = ((invalid_mask + lr_outlier_mask + hr_outlier_mask) >= 1).int().unsqueeze(0)
 
-		# Normalise imput
-		lr_subpatch = self.normalise(lr_subpatch, "lr", curr_tiles)
-		hr_subpatch = self.normalise(hr_subpatch, "hr", curr_tiles)
+		# Normalise input (tile-based approach)
+		#lr_subpatch = self.normalise(lr_subpatch, "lr", curr_tiles)
+		#hr_subpatch = self.normalise(hr_subpatch, "hr", curr_tiles)
+        
+		# Normalise input (subpatch-based approach)
+		lr_subpatch, hr_subpatch = self.normalise_subpatchbased(lr_subpatch, hr_subpatch)
 
-		
 		# Perform data augmentation
 		if self.transforms: 
 			outcomes = torch.rand((2))
@@ -493,8 +553,8 @@ class MODIS_dataset():
 			hr_subpatch = ttf.rotate(hr_subpatch, angle)
 			invalid_mask = ttf.rotate(invalid_mask, angle)
 
-		# Check dimension!!!	
-		return lr_subpatch, hr_subpatch, invalid_mask
+		# Check dimension!!!
+		return lr_subpatch.unsqueeze(0), hr_subpatch.unsqueeze(0), invalid_mask
 
 
 if __name__ == "__main__":
@@ -504,14 +564,14 @@ if __name__ == "__main__":
 	#datafilter.scan_all()
 	
 	mds = MODIS_dataset(
-		lr_filepath="./../data/MOD11B1/",
-		hr_filepath="./../data/MOD11A1/",
+		lr_filepath="./",
+		hr_filepath="./",
 		qa="./scanning_paired_dataset.csv",
 		zerof_thr=0.8,
 		cloud_thr=0.8,
 		error_thr=0.8,
 		up_scale=6,
-		kernel_size=7,
+		kernel_size=5,
 		train_params="./train_params_tiles_2019_2020_2021_2022.csv",
 		data_set = "train",
 		seed = 8609)
