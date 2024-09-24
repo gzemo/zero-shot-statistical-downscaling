@@ -19,7 +19,9 @@ from quality_assessment import init_qc_table
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SF = 0.02
-THRESHOLD = 0.01
+
+# Zero filled threshold
+ZF_THRESHOLD = 0.1
 
 
 class Mask_AvgPool2d(torch.nn.Module):
@@ -137,7 +139,7 @@ class DataFilter():
 				if noerror in filtered.LST_Err.unique() \
 				else 0.
 
-		return round(cloud_perc, 6), round(error_perc, 6)
+		return cloud_perc, error_perc
 
 	@staticmethod
 	def _estimate_zerofilled(tile):
@@ -293,7 +295,6 @@ class MODIS_dataset(Dataset):
 		self.hr_layer_spec_name = "1km"
 
 		# Initialize padding layer:
-		print("Hardcoded!") # should be enable to be a valid torch instance
 		self.average_pooling = Mask_AvgPool2d(self.kernel_size, stride=1, padding=self.kernel_size//2).to(DEVICE)
 
 		# Filtering QA table according to thresholds
@@ -360,10 +361,10 @@ class MODIS_dataset(Dataset):
 		"""
 		condition = (data < (data.mean() - nstd*data.std())) | (data > (data.mean() + nstd*data.std()))
 		outlier_map = torch.where(condition, 1, 0)
-        
+
 		# Check dimension
 		outlier_map = outlier_map.unsqueeze(0) if len(outlier_map.shape) < 3 else outlier_map
-                    
+
 		return outlier_map
 
 
@@ -386,12 +387,12 @@ class MODIS_dataset(Dataset):
 			hr_data: (torch.Tensor) hr data
 		"""
 		# Merge data and perform random cropping
-               
+
 		data = torch.cat([lr_data, hr_data], 1)
-        
+
 		subpatch = tt.Compose([tt.RandomCrop((self.patch_size, self.patch_size))])(data)
 		lr_subpatch, hr_subpatch = subpatch[:,0,:,:], subpatch[:,1,:,:]
-        
+
 		# Estimate binary mask for valide / invalid values
 		valid_mask = torch.cat([lr_subpatch, hr_subpatch], 0).all(0).int().unsqueeze(0)
 		invalid_mask = torch.abs(valid_mask - 1).int()
@@ -406,7 +407,7 @@ class MODIS_dataset(Dataset):
 
 		lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
-		while invalid_mask.float().mean().item() > THRESHOLD:
+		while invalid_mask.float().mean().item() > ZF_THRESHOLD:
 			lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
 		return lr_subpatch, hr_subpatch, invalid_mask
@@ -453,7 +454,7 @@ class MODIS_dataset(Dataset):
 		# If no missing value
 		if torch.abs(outlier_map - 1).all().item():
 			return data, init_outlier_map.int()
-        
+
 		avg_map = self.average_pooling(data)
 		patience = 0
 
@@ -478,17 +479,22 @@ class MODIS_dataset(Dataset):
 		""" Standardize image value according to intra-tiles mean
 		"""
 		train_mean, train_var = self.get_train_params(res, tiles)
-		data = (data - train_mean) / np.sqrt(train_var); print(data.shape, type(data))
+		data = (data - train_mean) / np.sqrt(train_var)
 		return data
-    
+
+
 	def normalise_subpatchbased(self, lr_data, hr_data):
-		""" Standardize image value according to the current LR-HR sub-patch mean
+		""" Standardize image value according to the current {LR-HR} sub-patch mean/var
 		"""
 		merged_data = torch.cat([lr_data, hr_data], 0)
 		mmean, mstd = merged_data[merged_data!=0].mean(), merged_data[merged_data!=0].std()
 		lr_data = (lr_data - mmean) / mstd
 		hr_data = (hr_data - mmean) / mstd
 		return lr_data, hr_data  
+
+
+	def __len__(self):
+		return self.qa.shape[0]
 
 
 	def __getitem__(self, idx):
@@ -507,14 +513,13 @@ class MODIS_dataset(Dataset):
 			curr_filename = curr_line[f"{res}_files"]
 			spec_name = self.lr_layer_spec_name if res == "lr" else self.hr_layer_spec_name
 			curr_layer = f"LST_{layer}_{spec_name}"
-			print( os.path.join(curr_path, curr_filename))
 
 			# Load data
 			pair[res] = self._read_rescale_data(os.path.join(curr_path, curr_filename), curr_layer, SF)
 
 		# Iterate until a valid mask is given
 		lr_subpatch, hr_subpatch, invalid_mask = self.yield_subpatch(pair["lr"], pair["hr"])
-        
+
 		# Impute missing for both LR and HR
 		lr_subpatch = self.impute_missing(lr_subpatch, invalid_mask)
 		hr_subpatch = self.impute_missing(hr_subpatch, invalid_mask)
@@ -524,13 +529,12 @@ class MODIS_dataset(Dataset):
 		hr_subpatch, hr_outlier_mask = self.impute_outliers(hr_subpatch)
 
 		# Merge invalid masks
-		#invalid_mask = torch.cat([invalid_mask, lr_outlier_mask, hr_outlier_mask], 0).any(0).unsqueeze(0)
-		invalid_mask = ((invalid_mask + lr_outlier_mask + hr_outlier_mask) >= 1).int().unsqueeze(0)
+		invalid_mask = ((invalid_mask + lr_outlier_mask + hr_outlier_mask) >= 1).int()
 
 		# Normalise input (tile-based approach)
 		#lr_subpatch = self.normalise(lr_subpatch, "lr", curr_tiles)
 		#hr_subpatch = self.normalise(hr_subpatch, "hr", curr_tiles)
-        
+
 		# Normalise input (subpatch-based approach)
 		lr_subpatch, hr_subpatch = self.normalise_subpatchbased(lr_subpatch, hr_subpatch)
 
@@ -553,19 +557,25 @@ class MODIS_dataset(Dataset):
 			hr_subpatch = ttf.rotate(hr_subpatch, angle)
 			invalid_mask = ttf.rotate(invalid_mask, angle)
 
-		# Check dimension!!!
-		return lr_subpatch.unsqueeze(0), hr_subpatch.unsqueeze(0), invalid_mask
+		return lr_subpatch, hr_subpatch, invalid_mask
 
 
 if __name__ == "__main__":
 
+	"""
 	# Example usage
-	#datafilter =  DataFilter("./../data/MOD11B1/", "./../data/MOD11A1/", 0.1)
-	#datafilter.scan_all()
+	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
+	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
+	datafilter =  DataFilter(PATH_LR, PATH_HR, 0.1)
+	datafilter.scan_all()
 	
+	"""
+	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
+	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
+
 	mds = MODIS_dataset(
-		lr_filepath="./",
-		hr_filepath="./",
+		lr_filepath=PATH_LR,
+		hr_filepath=PATH_HR,
 		qa="./scanning_paired_dataset.csv",
 		zerof_thr=0.8,
 		cloud_thr=0.8,
@@ -575,3 +585,4 @@ if __name__ == "__main__":
 		train_params="./train_params_tiles_2019_2020_2021_2022.csv",
 		data_set = "train",
 		seed = 8609)
+	

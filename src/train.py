@@ -117,13 +117,14 @@ def get_scheduler(optimizer, gamma=0.99):
 def get_loaders(thresholds, batch_size):
 	""" Return Train / Validation dataloader
 	"""
-	dls = dict()
+	dls = []
 
+	print(thresholds)
 	zerof_thr, cloud_thr, error_thr = thresholds
 
 	for dataset in ["train", "val"]:
 
-		toshufle = True if dataset == "train" else False 
+		toshufle = False if dataset == "train" else False 
 
 		# Custom cloud thr for validation
 		#cloud_thr = cloud_thr if dataset == "train" else 0.01
@@ -138,14 +139,14 @@ def get_loaders(thresholds, batch_size):
 			up_scale=6,
 			kernel_size=5,
 			train_params=PARAMS,
-			data_set="train",
+			data_set=dataset,
 			seed=SEED)
 
-		dls[dataset] = torch.utils.data.DataLoader(mds, 
-						batch_size=batch_size, shuffle=toshufle,
-						num_workers=16)
+		dls.append( torch.utils.data.DataLoader(mds, 
+					batch_size=batch_size, shuffle=toshufle,
+					num_workers=16) )
 
-	return dls["train"], dls["val"]
+	return dls[0], dls[1]
 
 
 def display_training(cache, spec):
@@ -329,7 +330,7 @@ if __name__=="__main__":
 	parser.add_argument('-lr','--learning-rate', type=float, help='Learning rate', required=True)
 	parser.add_argument('-zt','--zerofilled-threshold', type=float, help='Zero-filled values threshold', required=True)
 	parser.add_argument('-ct','--cloud-threshold', type=float, help='Cloud covereage threshold', required=True)
-	pasrse.add_argument('-et','--error-threshold', type=float, help='Temperature error threshold', required=True)
+	parser.add_argument('-et','--error-threshold', type=float, help='Temperature error threshold', required=True)
 	parser.add_argument('-c' ,'--checkpoint-path', type=str, help='Past model checkpoint', required=False)
 	parser.add_argument('-f' ,'--fine-tune', action='store_true', help='Fine-tune resetting optimizer and scheduler', required=False)
 	args = vars(parser.parse_args())
@@ -351,6 +352,7 @@ if __name__=="__main__":
 	cpk_path   = args["checkpoint_path"]
 	is_fine_tune = args["fine_tune"]
 	thresholds = (args["zerofilled_threshold"], args["cloud_threshold"], args["error_threshold"])
+	print(thresholds)
 
 	# Initialise model 
 	model         = get_model(model_name)
@@ -372,7 +374,6 @@ if __name__=="__main__":
 		optimizer= optimizer,
 		scheduler= scheduler,
 		batch_size= batch_size,
-		thresholds= (zerof_thr, cloud_thr, error_thr), 
 		checkpoint_path= cpk_path,
 		is_fine_tune= is_fine_tune,
 		verbose=True)
