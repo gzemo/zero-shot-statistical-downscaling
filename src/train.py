@@ -19,8 +19,11 @@ PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
 PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
 QA      = "/home/giacomo.t/src/scanning_paired_dataset.csv"
 PARAMS  = "/home/giacomo.t/src/train_params_tiles_2019_2020_2021_2022.csv"
-
+UP_SCALE = 6
+KERNEL_SIZE = 5
 SEED = 8609
+
+REAL_MATCH = False # whether to train with {LR-HR} or {f(HR)-HR}
 
 # initialize similarity
 ssim = SSIM().to(DEVICE)
@@ -28,60 +31,84 @@ ssim = SSIM().to(DEVICE)
 
 class Masked_MSE(torch.nn.Module):
 
-    def __init__(self, imputed_weight:float = 0.0001):
+    def __init__(self, imputed_weight:float = 10e-8):
         super(Masked_MSE, self).__init__()
         self.imputed_weight = imputed_weight
         
-    def forward(self, x, y, imputed_mask):
+    def forward(self, x, y, invalid_mask, datamean, datastd):
 
-    	# Compute valid mask
-        valid_mask = torch.abs(imputed_mask.float() -1)
-        n_valid, n_imputed = valid_mask.sum(), imputed_mask.sum()
-
+        # Compute valid mask
+        valid_mask = torch.abs(invalid_mask.int() - 1)
+        n_valid, n_imputed = valid_mask.sum(), invalid_mask.sum()
+        
         # Perform mse over valid and imputed imputs separately
         curr_diff   = torch.subtract(x,y)
         mse_valid   = torch.div(torch.multiply(torch.square(curr_diff), valid_mask).sum(), n_valid)
-        mse_imputed = torch.div(torch.multiply(torch.square(curr_diff), imputed_mask).sum(), n_imputed)\
+        mse_imputed = torch.div(torch.multiply(torch.square(curr_diff), invalid_mask).sum(), n_imputed)\
             if n_imputed > 0 else 0
 
         # Concat over channel dim
-        x = torch.cat(tuple([x.squeeze(0) for _ in range(3)]),0).unsqueeze(0)
-        y = torch.cat(tuple([y.squeeze(0) for _ in range(3)]),0).unsqueeze(0)
+        x = torch.cat(tuple([x.squeeze(0) for _ in range(3)]), 1)
+        y = torch.cat(tuple([y.squeeze(0) for _ in range(3)]), 1)
+        b, c, h, w = x.shape
+
+        # De-normalize to estimate SSIM
+        x = x * datastd + datamean
+        y = y * datastd + datamean
+        
+        # Rescale to [0,1] range
+        xmax = x.reshape(b, c*h*w).max(1).values.reshape(b, 1, 1, 1)
+        ymax = y.reshape(b, c*h*w).max(1).values.reshape(b, 1, 1, 1)
+        x = x / xmax
+        y = y / ymax
 
         # Compute ssim over valid data
         simm_loss = 1 - ssim(torch.multiply(x, valid_mask), torch.multiply(y, valid_mask))
 
-        return mse_valid + self.imputed_weight * mse_imputed + simm_loss
+        return mse_valid + self.imputed_weight*mse_imputed + simm_loss
 
 
 class Masked_MEA(torch.nn.Module):
 
-    def __init__(self, imputed_weight:float = 0.0001):
+    def __init__(self, imputed_weight:float = 10e-8):
         super(Masked_MSE, self).__init__()
         self.imputed_weight = imputed_weight
 
-    def forward(self, x, y, imputed_mask):
+    def forward(self, x, y, invalid_mask, datamean, datastd):
 
-        # Perform maw over valid and imputed imputs separately
-        valid_mask = torch.abs(imputed_mask.float() -1)
-        n_valid, n_imputed = valid_mask.sum(), imputed_mask.sum()
+    	# Compute valid mask
+        valid_mask = torch.abs(invalid_mask.int() - 1)
+        n_valid, n_imputed = valid_mask.sum(), invalid_mask.sum()
+
+        # Perform mse over valid and imputed imputs separately
         curr_diff   = torch.subtract(x,y)
         mae_valid   = torch.div(torch.multiply(torch.abs(curr_diff), valid_mask).sum(), n_valid)
-        mae_imputed = torch.div(torch.multiply(torch.abs(curr_diff), imputed_mask).sum(), n_imputed)\
+        mae_imputed = torch.div(torch.multiply(torch.abs(curr_diff), invalid_mask).sum(), n_imputed)\
             if n_imputed > 0 else 0
 
        # Concat over channel dim
-        x = torch.cat(tuple([x.squeeze(0) for _ in range(3)]),0).unsqueeze(0)
-        y = torch.cat(tuple([y.squeeze(0) for _ in range(3)]),0).unsqueeze(0)
+        x = torch.cat(tuple([x.squeeze(0) for _ in range(3)]), 1)
+        y = torch.cat(tuple([y.squeeze(0) for _ in range(3)]), 1)
+        b, c, h, w = x.shape
+
+        # De-normalize to estimate SSIM
+        x = x * datastd + datamean 
+        y = y * datastd + datamean
+
+        # Rescale to [0,1] range
+        xmax = x.reshape(b, c*h*w).max(1).values.reshape(b, 1, 1, 1)
+        ymax = y.reshape(b, c*h*w).max(1).values.reshape(b, 1, 1, 1)
+        x = x / xmax
+        y = y / ymax
 
         # Compute ssim over valid data
         simm_loss = 1 - ssim(torch.multiply(x, valid_mask), torch.multiply(y, valid_mask))
 
-        return mae_valid + self.imputed_weight * mae_imputed + simm_loss
+        return mae_valid + self.imputed_weight*mae_imputed + simm_loss
 
 
 
-def get_model(model_name, scale_factor=6, nchannels=1, multi_image=False):
+def get_model(model_name, scale_factor=SF, nchannels=1, multi_image=False):
 	if model_name == "srcnn":
 		model = build_srcnn(nchannels, multi_image=False)
 	elif model_name == "unet":
@@ -110,7 +137,7 @@ def get_scheduler(optimizer, gamma=0.99):
 	#scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 	#scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
-		factor=0.1, patience=3, threshold=0.001, threshold_mode='abs')
+		factor=0.1, patience=3, threshold=0.0001, threshold_mode='abs')
 	return scheduler
 
 
@@ -120,7 +147,7 @@ def get_loaders(thresholds, batch_size):
 	dls = []
 
 	print(thresholds)
-	zerof_thr, cloud_thr, error_thr = thresholds
+	zerof_thr, cloud_thr, error_thr, impute_thr = thresholds
 
 	for dataset in ["train", "val"]:
 
@@ -129,18 +156,33 @@ def get_loaders(thresholds, batch_size):
 		# Custom cloud thr for validation
 		#cloud_thr = cloud_thr if dataset == "train" else 0.01
 
-		mds = MODIS_dataset(
-			lr_filepath=PATH_LR,
-			hr_filepath=PATH_HR,
-			qa=QA,
-			zerof_thr=zerof_thr,
-			cloud_thr=cloud_thr,
-			error_thr=error_thr,
-			up_scale=6,
-			kernel_size=5,
-			train_params=PARAMS,
-			data_set=dataset,
-			seed=SEED)
+		if REAL_MATCH:
+			mds = MODIS_dataset(
+				lr_filepath=PATH_LR,
+				hr_filepath=PATH_HR,
+				qa=QA,
+				zerof_thr=zerof_thr,
+				cloud_thr=cloud_thr,
+				error_thr=error_thr,
+				impute_thr=impute_thr,
+				up_scale=UP_SCALE,
+				kernel_size=KERNEL_SIZE,
+				train_params=PARAMS,
+				data_set=dataset,
+				seed=SEED)
+		else:
+			mds = MODIS_dataset_single(
+				hr_filepath=PATH_HR,
+				qa=QA,
+				zerof_thr=zerof_thr,
+				cloud_thr=cloud_thr,
+				error_thr=error_thr,
+				impute_thr=impute_thr,
+				up_scale=UP_SCALE,
+				kernel_size=KERNEL_SIZE,
+				train_params=PARAMS,
+				data_set=dataset,
+				seed=SEED)
 
 		dls.append( torch.utils.data.DataLoader(mds, 
 					batch_size=batch_size, shuffle=toshufle,
@@ -153,14 +195,14 @@ def display_training(cache, spec):
 	""" Save final evaluation metrics plot
 	"""
 	cache = pd.DataFrame(cache,
-			columns = ["train_loss", "train_mse", "train_mae", "train_bias", "train_rs", "train_pcc",
-				       "val_loss", "val_mse", "val_mae", "val_bias", "val_rs", "val_pcc"])
+			columns = ["train_loss", "train_mae", "train_bias", "train_rs", "train_pcc",
+				       "val_loss", "val_mae", "val_bias", "val_rs", "val_pcc"])
 
 	fig, axs = plt.subplots(1, 4, figsize=(15,5))
 	axs = axs.flatten()
 	for i in range(len(axs)):
 		axs[i].plot(cache[cache.columns[i]].values, label="Train")
-		axs[i].plot(cache[cache.columns[i+6]].values, label="Val")
+		axs[i].plot(cache[cache.columns[i+5]].values, label="Val")
 		axs[i].set_title(cache.columns[i].split("_")[-1], fontsize=12)
 		axs[i].set_xlabel("Epochs")
 		axs[i].grid(0.4)
@@ -177,7 +219,7 @@ def collect_metrics(sr, hr):
 		sr: super-resolved data (b, c, h, w)
 		hr: ground-truth (b, c, h, w)
 	"""
-	mse    = torch.square(sr-hr).mean().item()
+	#mse    = torch.square(sr-hr).mean().item()
 	mae    = torch.abs(sr-hr).mean().item()
 	bias   = (sr-hr).mean().item()
 	ss_tot = torch.square(sr-sr.mean()).mean().item()
@@ -187,7 +229,7 @@ def collect_metrics(sr, hr):
 	tmp[0,:] = sr.flatten()
 	tmp[1,:] = hr.flatten()
 	pcc = torch.corrcoef(tmp)[0,1].item()
-	return torch.Tensor([mse, bias, rs, pcc])
+	return torch.Tensor([mae, bias, rs, pcc])
 
 
 
@@ -197,7 +239,7 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 	verbose=True):
 	""" Perform num_epochs training run
 	"""
-	cache = np.zeros((num_epochs, 12))
+	cache = np.zeros((num_epochs, 10))
 
 	if checkpoint_path:
 
@@ -225,15 +267,17 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 		progression_bar = tqdm(dataloader_train, total=dataloader_train.__len__())
 		for batch in progression_bar:
 			
-			lr, hr, imputed_mask = batch          
-  
+			lr, hr, invalid_mask, datamean, datastd = batch
+
 			lr = lr.to(DEVICE)
 			hr = hr.to(DEVICE)
-			#imputed_mask = imputed_mask.to(DEVICE)
+			invalid_mask = invalid_mask.to(DEVICE)
+			datamean = datamean.to(DEVICE)
+			datastd = datastd.to(DEVICE)
 
 			# Compute Feed-forward and current batch cost
 			output = model(lr).to(DEVICE)
-			loss = loss_function(output, hr) #, imputed_mask)
+			loss = loss_function(output, hr, invalid_mask, datamean, datastd)
 
 			# Update models params
 			loss.backward()
@@ -262,14 +306,17 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 		with torch.no_grad():
 			for batch in progression_bar:
 				
-				lr, hr, imputed_mask = batch
+				lr, hr, invalid_mask, datamean, datastd = batch
+			
 				lr = lr.to(DEVICE)
 				hr = hr.to(DEVICE)
-				#imputed_mask = imputed_mask.to(DEVICE)
+				invalid_mask = invalid_mask.to(DEVICE)
+				datamean = datamean.to(DEVICE)
+				datastd = datastd.to(DEVICE)
 
 				# Compute Feed-forward and current batch cost
 				output = model(lr).to(DEVICE)
-				loss = loss_function(output, hr)#, imputed_mask)
+				loss = loss_function(output, hr, invalid_mask, datamean, datastd)
 
 				# Update Loss
 				cum_loss_v += loss.item()
@@ -298,7 +345,7 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 			print(f"Epoch: {e}/{num_epochs} - Train Cost: {train_loss:.7f}  Validation Cost: {val_loss:.7f}")
 
 		# Save current epoch's checkpoint after num_epochs
-		if epochs % 10 == 0:
+		if e % 20 == 0:
 			torch.save({
 				'epoch': e,
 				'model_state_dict': model.state_dict(),
@@ -308,10 +355,12 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 			}, f"./checkpoint/{run_name}_ce{e}.pt")
 
 	# Save Training performance
-	pd.DataFrame(cache,
-		columns = ["train_loss", "train_mse", "train_mae", "train_bias", "train_rs", "train_pcc",
-				   "val_loss", "val_mse", "val_mae", "val_bias", "val_rs", "val_pcc"]
-				).to_csv(f"./checkpoint/{run_name}_performance.csv", index=False)
+	pd.DataFrame(
+		cache,
+		columns = ["train_loss", "train_mae", "train_bias", "train_rs", "train_pcc",
+   				"val_loss", "val_mae", "val_bias", "val_rs", "val_pcc"]
+		)\
+	.to_csv(f"./checkpoint/{run_name}_performance.csv", index=False)
 
 	display_training(cache, run_name)
 
@@ -321,6 +370,7 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 
 if __name__=="__main__":
 
+	print("!!!! check error on hr NIGHT acqusition !!!")
 	# Parse arguments
 	parser = argparse.ArgumentParser(description='Training SR model')
 	parser.add_argument('-m' ,'--model-name', type=str, help='Model name: allowed (srcnn, unet, resunet, haunet, ...)', required=True)
@@ -331,6 +381,7 @@ if __name__=="__main__":
 	parser.add_argument('-zt','--zerofilled-threshold', type=float, help='Zero-filled values threshold', required=True)
 	parser.add_argument('-ct','--cloud-threshold', type=float, help='Cloud covereage threshold', required=True)
 	parser.add_argument('-et','--error-threshold', type=float, help='Temperature error threshold', required=True)
+	parser.add_argument('-it','--impute-threshold', type=float, help='Zero-filling imputing threshold', required=True)
 	parser.add_argument('-c' ,'--checkpoint-path', type=str, help='Past model checkpoint', required=False)
 	parser.add_argument('-f' ,'--fine-tune', action='store_true', help='Fine-tune resetting optimizer and scheduler', required=False)
 	args = vars(parser.parse_args())
@@ -351,8 +402,10 @@ if __name__=="__main__":
 	lr         = args["learning_rate"]
 	cpk_path   = args["checkpoint_path"]
 	is_fine_tune = args["fine_tune"]
-	thresholds = (args["zerofilled_threshold"], args["cloud_threshold"], args["error_threshold"])
-	print(thresholds)
+	thresholds = (args["zerofilled_threshold"], args["cloud_threshold"],
+				 args["error_threshold"], args["impute_threshold"])
+
+	print("Thresholds:\n", thresholds)
 
 	# Initialise model 
 	model         = get_model(model_name)

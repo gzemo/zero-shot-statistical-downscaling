@@ -20,8 +20,6 @@ from quality_assessment import init_qc_table
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SF = 0.02
 
-# Zero filled threshold
-ZF_THRESHOLD = 0.1
 
 
 class Mask_AvgPool2d(torch.nn.Module):
@@ -254,6 +252,7 @@ class MODIS_dataset(Dataset):
 		zerof_thr,
 		cloud_thr,
 		error_thr,
+		impute_thr,
 		up_scale,
 		kernel_size,
 		train_params,
@@ -265,13 +264,13 @@ class MODIS_dataset(Dataset):
 		qa: (str) path to file to qa scanning (LR-HR matching)
 		...
 		"""
-
 		self.lr_filepath = lr_filepath
 		self.hr_filepath = hr_filepath
 
 		self.zerof_thr = zerof_thr
 		self.cloud_thr = cloud_thr
 		self.error_thr = error_thr
+		self.impute_thr = impute_thr
 
 		self.up_scale = up_scale
 		self.seed = seed
@@ -314,7 +313,7 @@ class MODIS_dataset(Dataset):
 			(self.qa.hr_Night_error_perc < self.error_thr)
 		]
 
-		print("Collected # paired LR-HR data: ", self.qa.shape)
+		print("Collected # paired LR-HR data: ", self.qa.shape[0])
 
 		# Year/tiles based train/validation/test set
 		if data_set == "test":
@@ -334,10 +333,17 @@ class MODIS_dataset(Dataset):
 
 		self.qa = self.qa.reset_index().drop(columns="index")
 
-		# Reshufle
+		# Set seeds 
+		random.seed(self.seed)
 		np.random.seed(self.seed)
+		torch.manual_seed(self.seed)
+
+		# Reshufle
 		qa_idx = list(self.qa.index)
-		np.random.shuffle(qa_idx)
+
+		if data_set == "train":
+			np.random.shuffle(qa_idx)
+
 		self.qa_reshufle = self.qa.iloc[qa_idx]
 
 	@staticmethod
@@ -361,10 +367,10 @@ class MODIS_dataset(Dataset):
 		"""
 		condition = (data < (data.mean() - nstd*data.std())) | (data > (data.mean() + nstd*data.std()))
 		outlier_map = torch.where(condition, 1, 0)
-
+        
 		# Check dimension
 		outlier_map = outlier_map.unsqueeze(0) if len(outlier_map.shape) < 3 else outlier_map
-
+                    
 		return outlier_map
 
 
@@ -387,12 +393,12 @@ class MODIS_dataset(Dataset):
 			hr_data: (torch.Tensor) hr data
 		"""
 		# Merge data and perform random cropping
-
+               
 		data = torch.cat([lr_data, hr_data], 1)
-
+        
 		subpatch = tt.Compose([tt.RandomCrop((self.patch_size, self.patch_size))])(data)
 		lr_subpatch, hr_subpatch = subpatch[:,0,:,:], subpatch[:,1,:,:]
-
+        
 		# Estimate binary mask for valide / invalid values
 		valid_mask = torch.cat([lr_subpatch, hr_subpatch], 0).all(0).int().unsqueeze(0)
 		invalid_mask = torch.abs(valid_mask - 1).int()
@@ -407,7 +413,7 @@ class MODIS_dataset(Dataset):
 
 		lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
-		while invalid_mask.float().mean().item() > ZF_THRESHOLD:
+		while invalid_mask.float().mean().item() > self.impute_thr:
 			lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
 		return lr_subpatch, hr_subpatch, invalid_mask
@@ -454,7 +460,7 @@ class MODIS_dataset(Dataset):
 		# If no missing value
 		if torch.abs(outlier_map - 1).all().item():
 			return data, init_outlier_map.int()
-
+        
 		avg_map = self.average_pooling(data)
 		patience = 0
 
@@ -480,17 +486,26 @@ class MODIS_dataset(Dataset):
 		"""
 		train_mean, train_var = self.get_train_params(res, tiles)
 		data = (data - train_mean) / np.sqrt(train_var)
-		return data
+		return data, train_mean, train_var
 
 
 	def normalise_subpatchbased(self, lr_data, hr_data):
 		""" Standardize image value according to the current {LR-HR} sub-patch mean/var
 		"""
-		merged_data = torch.cat([lr_data, hr_data], 0)
-		mmean, mstd = merged_data[merged_data!=0].mean(), merged_data[merged_data!=0].std()
-		lr_data = (lr_data - mmean) / mstd
-		hr_data = (hr_data - mmean) / mstd
-		return lr_data, hr_data  
+		
+		#concat = torch.cat([lr_data, hr_data], 0)
+		#c, h, w = concat.shape
+		#datamean = concat.reshape(c*h*w).mean(1).reshape(b, 1, 1, 1)
+		#datastd  = concat.reshape(c*h*w).std(1).reshape(b, 1, 1, 1)
+       
+		concat = torch.cat([lr_data, hr_data], 0)
+		concat = concat[concat!=0].flatten()
+		datamean, datastd = concat.mean(), concat.std()
+        
+		lr_data = (lr_data - datamean) / datastd
+		hr_data = (hr_data - datamean) / datastd
+        
+		return lr_data, hr_data, datamean, datastd  
 
 
 	def __len__(self):
@@ -500,7 +515,6 @@ class MODIS_dataset(Dataset):
 	def __getitem__(self, idx):
 		"""Yield {LR, HR, invalid_pixels_mask} 
 		"""
-
 		pair = dict()
 		curr_line = self.qa_reshufle.iloc[idx]
 		curr_tiles = curr_line["lr_tiles"]
@@ -519,7 +533,7 @@ class MODIS_dataset(Dataset):
 
 		# Iterate until a valid mask is given
 		lr_subpatch, hr_subpatch, invalid_mask = self.yield_subpatch(pair["lr"], pair["hr"])
-
+        
 		# Impute missing for both LR and HR
 		lr_subpatch = self.impute_missing(lr_subpatch, invalid_mask)
 		hr_subpatch = self.impute_missing(hr_subpatch, invalid_mask)
@@ -529,14 +543,15 @@ class MODIS_dataset(Dataset):
 		hr_subpatch, hr_outlier_mask = self.impute_outliers(hr_subpatch)
 
 		# Merge invalid masks
+		#invalid_mask = torch.cat([invalid_mask, lr_outlier_mask, hr_outlier_mask], 0).any(0).unsqueeze(0)
 		invalid_mask = ((invalid_mask + lr_outlier_mask + hr_outlier_mask) >= 1).int()
 
 		# Normalise input (tile-based approach)
 		#lr_subpatch = self.normalise(lr_subpatch, "lr", curr_tiles)
 		#hr_subpatch = self.normalise(hr_subpatch, "hr", curr_tiles)
-
+        
 		# Normalise input (subpatch-based approach)
-		lr_subpatch, hr_subpatch = self.normalise_subpatchbased(lr_subpatch, hr_subpatch)
+		lr_subpatch, hr_subpatch, datamean, datastd = self.normalise_subpatchbased(lr_subpatch, hr_subpatch)
 
 		# Perform data augmentation
 		if self.transforms: 
@@ -557,19 +572,181 @@ class MODIS_dataset(Dataset):
 			hr_subpatch = ttf.rotate(hr_subpatch, angle)
 			invalid_mask = ttf.rotate(invalid_mask, angle)
 
-		return lr_subpatch, hr_subpatch, invalid_mask
+		return lr_subpatch, hr_subpatch, invalid_mask, datamean.reshape(1,1,1), datastd.reshape(1,1,1)
 
 
+class MODIS_dataset_single(MODIS_dataset):
+
+	def __init__(self,
+		hr_filepath,
+		qa,
+		zerof_thr,
+		cloud_thr,
+		error_thr,
+		impute_thr,
+		up_scale,
+		kernel_size,
+		train_params,
+		data_set = "train",
+		seed = 8609):
+		"""
+		Args:
+		...
+		qa: (str) path to file to qa scanning (LR-HR matching)
+		...
+		"""
+		self.hr_filepath = hr_filepath
+
+		self.zerof_thr = zerof_thr
+		self.cloud_thr = cloud_thr
+		self.error_thr = error_thr
+		self.impute_thr = impute_thr
+
+		self.up_scale = up_scale
+		self.seed = seed
+
+		# Subpatches sizes
+		self.patch_size = 64
+
+		#self.lr_data_shape = (1, self.lr_subtile_size*4, self.lr_subtile_size*4)
+		#self.hr_data_shape = (1, self.hr_subtile_size*4, self.hr_subtile_size*4)
+
+		# Collect subtiles-coordinates (not needed since it would be random)
+		#stc = SubTilesCoords(self.lr_data_shape, self.hr_data_shape, self.lr_subtile_size, self.hr_subtile_size)
+		#self.subtiles_coords = stc.get_coords()
+
+		# Flag to allow augmentation (enable only while training)
+		self.transforms = True if data_set == "train" else False
+		self.kernel_size = kernel_size
+		self.train_params = pd.read_csv(train_params)
+
+		self.hr_layer_spec_name = "1km"
+
+		# Initialize padding layer:
+		self.average_pooling = Mask_AvgPool2d(self.kernel_size, stride=1, padding=self.kernel_size//2).to(DEVICE)
+
+		# Filtering QA table according to thresholds
+		self.qa = pd.read_csv(qa)
+		self.qa = self.qa.loc[
+			(self.qa.hr_Day_zero_filled < self.zerof_thr) & \
+			(self.qa.hr_Day_cloud_perc < self.cloud_thr) & \
+			(self.qa.hr_Day_error_perc < self.error_thr) & \
+			(self.qa.hr_Night_zero_filled < self.zerof_thr) & \
+			(self.qa.hr_Night_cloud_perc < self.cloud_thr) & \
+			(self.qa.hr_Night_error_perc < self.error_thr)
+		]
+
+		print("Collected # paired HR data: ", self.qa.shape[0])
+
+		# Year/tiles based train/validation/test set
+		if data_set == "test":
+			self.qa = self.qa.loc[
+				(self.qa.lr_date.apply(lambda x: str(x)[1:5]).isin(["2023"])) &\
+				(self.qa.lr_tiles.isin(["h11v04", "h26v05"])) ]
+
+		elif data_set == "val":
+			self.qa = self.qa.loc[
+				(self.qa.lr_date.apply(lambda x: str(x)[1:5]).isin(["2023"])) &\
+				(self.qa.lr_tiles.isin(["h10v05", "h19v04"])) ]
+
+		elif data_set == "train":
+			self.qa = self.qa.loc[
+				self.qa.lr_date.apply(lambda x: str(x)[1:5])\
+				.isin(["2019", "2020", "2021", "2022"]) ]
+
+			
+
+			qa_idx = list(self.qa.index)
+			np.random.shuffle(qa_idx)
+			self.qa_reshufle = self.qa.iloc[qa_idx]
+
+		self.qa = self.qa.reset_index().drop(columns="index")
+
+
+
+	def degrade(self, data):
+		""" Image degradation according to the initial scale factor
+		"""
+		interp = F.interpolate(data, scale_factor=1/self.up_scale, mode="bilinear")
+		#interp = F.interpolate(interp, scale_factor=self.up_scale, mode="nearest-exact")
+		return interp
+
+
+	def __getitem__(self, idx):
+		"""Yield {LR, HR, invalid_pixels_mask} 
+		"""
+		# Define params
+		curr_line  = self.qa_reshufle.iloc[idx]
+		curr_tiles = curr_line["hr_tiles"]
+		curr_path  = self.hr_filepath
+		curr_filename = curr_line[f"hr_files"]
+		spec_name  = self.hr_layer_spec_name
+		
+		layer = np.random.choice(["Day", "Night"])
+		curr_layer = f"LST_{layer}_{spec_name}"
+		
+		hr_data = self._read_rescale_data(os.path.join(curr_path, curr_filename),
+					curr_layer, SF)
+		lr_data = self.degrade(hr_data)
+
+		# Iterate until a valid mask is given
+		lr_subpatch, hr_subpatch, invalid_mask = self.yield_subpatch(lr_data, hr_data)
+        
+		# Impute missing for both LR and HR
+		lr_subpatch = self.impute_missing(lr_subpatch, invalid_mask)
+		hr_subpatch = self.impute_missing(hr_subpatch, invalid_mask)
+
+		# Impute outliers (tile-based approach)
+		lr_subpatch, lr_outlier_mask = self.impute_outliers(lr_subpatch)
+		hr_subpatch, hr_outlier_mask = self.impute_outliers(hr_subpatch)
+
+		# Merge invalid masks
+		#invalid_mask = torch.cat([invalid_mask, lr_outlier_mask, hr_outlier_mask], 0).any(0).unsqueeze(0)
+		invalid_mask = ((invalid_mask + lr_outlier_mask + hr_outlier_mask) >= 1).int()
+
+		# Normalise input (tile-based approach)
+		#lr_subpatch = self.normalise(lr_subpatch, "lr", curr_tiles)
+		#hr_subpatch = self.normalise(hr_subpatch, "hr", curr_tiles)
+        
+		# Normalise input (subpatch-based approach)
+		lr_subpatch, hr_subpatch, datamean, datastd = self.normalise_subpatchbased(lr_subpatch, hr_subpatch)
+
+		# Perform data augmentation
+		if self.transforms: 
+			outcomes = torch.rand((2))
+
+			if outcomes[0].item() < 0.5:
+				lr_subpatch = tt.Compose([tt.RandomHorizontalFlip(p=1.)])(lr_subpatch)
+				hr_subpatch = tt.Compose([tt.RandomHorizontalFlip(p=1.)])(hr_subpatch)
+				invalid_mask = tt.Compose([tt.RandomHorizontalFlip(p=1.)])(invalid_mask)
+
+			if outcomes[1].item() < 0.5:
+				lr_subpatch = tt.Compose([tt.RandomVerticalFlip(p=1.)])(lr_subpatch)
+				hr_subpatch = tt.Compose([tt.RandomVerticalFlip(p=1.)])(hr_subpatch)
+				invalid_mask = tt.Compose([tt.RandomVerticalFlip(p=1.)])(invalid_mask)
+
+			angle = np.random.choice([0., 90., 180., 270.])
+			lr_subpatch = ttf.rotate(lr_subpatch, angle)
+			hr_subpatch = ttf.rotate(hr_subpatch, angle)
+			invalid_mask = ttf.rotate(invalid_mask, angle)
+
+		return lr_subpatch, hr_subpatch, invalid_mask, datamean.reshape(1,1,1), datastd.reshape(1,1,1)
+
+
+
+
+
+"""
 if __name__ == "__main__":
 
-	"""
+	
 	# Example usage
 	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
 	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
 	datafilter =  DataFilter(PATH_LR, PATH_HR, 0.1)
 	datafilter.scan_all()
 	
-	"""
+	
 	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
 	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
 
@@ -580,9 +757,10 @@ if __name__ == "__main__":
 		zerof_thr=0.8,
 		cloud_thr=0.8,
 		error_thr=0.8,
+		impute_thr=0.01,
 		up_scale=6,
 		kernel_size=5,
 		train_params="./train_params_tiles_2019_2020_2021_2022.csv",
 		data_set = "train",
 		seed = 8609)
-	
+"""
