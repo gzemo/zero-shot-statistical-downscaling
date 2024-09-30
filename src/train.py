@@ -146,7 +146,6 @@ def get_loaders(thresholds, batch_size):
 	"""
 	dls = []
 
-	print(thresholds)
 	zerof_thr, cloud_thr, error_thr, impute_thr = thresholds
 
 	for dataset in ["train", "val"]:
@@ -200,7 +199,7 @@ def display_training(cache, spec):
 
 	fig, axs = plt.subplots(1, 4, figsize=(15,5))
 	axs = axs.flatten()
-	for i in range(len(axs)):
+	for i in range(axs.shape[0]):
 		axs[i].plot(cache[cache.columns[i]].values, label="Train")
 		axs[i].plot(cache[cache.columns[i+5]].values, label="Val")
 		axs[i].set_title(cache.columns[i].split("_")[-1], fontsize=12)
@@ -345,7 +344,7 @@ def run_n_epoch(num_epochs, run_name, model, dataloader_train,
 			print(f"Epoch: {e}/{num_epochs} - Train Cost: {train_loss:.7f}  Validation Cost: {val_loss:.7f}")
 
 		# Save current epoch's checkpoint after num_epochs
-		if e % 20 == 0:
+		if e % 10 == 0:
 			torch.save({
 				'epoch': e,
 				'model_state_dict': model.state_dict(),

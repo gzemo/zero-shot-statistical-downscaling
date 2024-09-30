@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import numpy as np
 import pandas as pd
@@ -346,6 +347,15 @@ class MODIS_dataset(Dataset):
 
 		self.qa_reshufle = self.qa.iloc[qa_idx]
 
+		# Zero mean norm:
+		# True: to zerocentered input data (final output \in [-1, 1])
+		#   z = ({LR-HR} - mean({LR-HR})) / std({LR-HR})
+		#   z = z / max(z)
+		# False: to rescale to [0, 1]
+		#   {LR-HR} = {LR-HR} / max({LR-HR})
+		self.zeromean_norm = False
+
+
 	@staticmethod
 	def _read_rescale_data(filepath, layername, sf):
 		""" General utils function to open a hdf file and rescale it
@@ -409,7 +419,11 @@ class MODIS_dataset(Dataset):
 
 	def yield_subpatch(self, lr_data, hr_data):
 		# Interpolate with NN to match HR dimension
-		lr_data = F.interpolate(lr_data, scale_factor=self.up_scale, mode="nearest-exact")
+
+		# check whether lr-hr present the same dimension to test last attempt (see below)
+		# if degrade_old (different sizes),
+		if lr_data.shape != hr_data.shape:
+			lr_data = F.interpolate(lr_data, scale_factor=self.up_scale, mode="nearest-exact")
 
 		lr_subpatch, hr_subpatch, invalid_mask = self.crop_subpatch(lr_data, hr_data)
 
@@ -493,19 +507,29 @@ class MODIS_dataset(Dataset):
 		""" Standardize image value according to the current {LR-HR} sub-patch mean/var
 		"""
 		
-		#concat = torch.cat([lr_data, hr_data], 0)
-		#c, h, w = concat.shape
-		#datamean = concat.reshape(c*h*w).mean(1).reshape(b, 1, 1, 1)
-		#datastd  = concat.reshape(c*h*w).std(1).reshape(b, 1, 1, 1)
+		# solve individual pair normalization
+		# rescale to [-1; +1] interval
        
 		concat = torch.cat([lr_data, hr_data], 0)
 		concat = concat[concat!=0].flatten()
 		datamean, datastd = concat.mean(), concat.std()
         
-		lr_data = (lr_data - datamean) / datastd
-		hr_data = (hr_data - datamean) / datastd
-        
+        if self.zeromean_norm:
+	        # Zero mean centering
+			lr_data = (lr_data - datamean) / datastd
+			hr_data = (hr_data - datamean) / datastd
+
+		# Re-scaling to [-1, +1]
+		lr_data = lr_data / lr_data.max()
+		hr_data = hr_data / hr_data.max()
+
 		return lr_data, hr_data, datamean, datastd  
+
+	def normalise_datasetbase(self, lr_data, hr_data, datamax):
+		""" Return the [0,1] data normalisation according to the 
+		whole Dataset max value, regardless tiles acquisition
+		"""
+		raise NotImplementedError
 
 
 	def __len__(self):
@@ -654,22 +678,42 @@ class MODIS_dataset_single(MODIS_dataset):
 				self.qa.lr_date.apply(lambda x: str(x)[1:5])\
 				.isin(["2019", "2020", "2021", "2022"]) ]
 
-			
-
-			qa_idx = list(self.qa.index)
-			np.random.shuffle(qa_idx)
-			self.qa_reshufle = self.qa.iloc[qa_idx]
-
 		self.qa = self.qa.reset_index().drop(columns="index")
 
+		# Set seeds 
+		random.seed(self.seed)
+		np.random.seed(self.seed)
+		torch.manual_seed(self.seed)
+
+		# Reshufle
+		qa_idx = list(self.qa.index)
+
+		if data_set == "train":
+			np.random.shuffle(qa_idx)
+
+		self.qa_reshufle = self.qa.iloc[qa_idx]	
+
+		# Zero mean norm:
+		# True: to zerocentered input data (final output \in [-1, 1])
+		#   z = ({LR-HR} - mean({LR-HR})) / std({LR-HR})
+		#   z = z / max(z)
+		# False: to rescale to [0, 1]
+		#   {LR-HR} = {LR-HR} / max({LR-HR})
+		self.zeromean_norm = False
 
 
-	def degrade(self, data):
+
+	def degrade_old(self, data):
 		""" Image degradation according to the initial scale factor
 		"""
 		interp = F.interpolate(data, scale_factor=1/self.up_scale, mode="bilinear")
 		#interp = F.interpolate(interp, scale_factor=self.up_scale, mode="nearest-exact")
 		return interp
+
+	def degrade(self, data):
+		down = F.interpolate(data, scale_factor=1/self.up_scale, mode="bicubic")
+		up   = F.interpolate(down, scale_factor=self.up_scale, mode="bicubic")
+		return up
 
 
 	def __getitem__(self, idx):
