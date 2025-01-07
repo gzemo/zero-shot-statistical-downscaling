@@ -4,4 +4,6 @@
 
 [zssr](https://colab.research.google.com/drive/1RDszO9TXlty_A8VBEBeVE5KqZ19AH8Mm?authuser=0#scrollTo=ircAAAo_c03y)
 
+[zssr_norm](https://colab.research.google.com/drive/1Aqud____AUk7Z-ur5Qf8edz55Xa0fAGS#scrollTo=tcsxuIQkAean)
+
 [Resdiff](https://colab.research.google.com/drive/1Km454Fmi-wrtjJ0-VaAGOchkopYPlcNh?authuser=1#scrollTo=PZTyKKjgesmm)
