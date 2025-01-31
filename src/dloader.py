@@ -785,26 +785,26 @@ if __name__ == "__main__":
 
 	
 	# Example usage
-	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
-	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
+	PATH_LR = ""
+	PATH_HR = ""
 	datafilter =  DataFilter(PATH_LR, PATH_HR, 0.1)
 	datafilter.scan_all()
 	
 	
-	PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
-	PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
+	PATH_LR = ""
+	PATH_HR = ""
 
 	mds = MODIS_dataset(
 		lr_filepath=PATH_LR,
 		hr_filepath=PATH_HR,
-		qa="./scanning_paired_dataset.csv",
+		qa="",
 		zerof_thr=0.8,
 		cloud_thr=0.8,
 		error_thr=0.8,
 		impute_thr=0.01,
 		up_scale=6,
 		kernel_size=5,
-		train_params="./train_params_tiles_2019_2020_2021_2022.csv",
+		train_params="",
 		data_set = "train",
 		seed = 8609)
 """
