@@ -15,10 +15,10 @@ import matplotlib.pyplot as plt
 
 # go on with others
 DEVICE  = "cuda:0" if torch.cuda.is_available() else "cpu"
-PATH_LR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
-PATH_HR = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
-QA      = "/home/giacomo.t/src/scanning_paired_dataset.csv"
-PARAMS  = "/home/giacomo.t/src/train_params_tiles_2019_2020_2021_2022.csv"
+PATH_LR = ""
+PATH_HR = ""
+QA      = ""
+PARAMS  = ""
 UP_SCALE = 6
 KERNEL_SIZE = 5
 SEED = 8609
