@@ -638,25 +638,21 @@ def eval_profile(net, img):
 if __name__ == "__main__":
 
     """
-    mds = MODIS_dataset("/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1",
-                "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1",
-                "/home/giacomo.t/src/resulting_scanning_MOD11B1.csv",
-                "/home/giacomo.t/src/resulting_scanning_MOD11A1.csv",
+    mds = MODIS_dataset("", "", "", "", 
                 cloud_coverage=0.0001, 
                 error_thr=0.1,
                 up_scale=6, 
                 kernel_size=7,
-                train_params="./train_params_tiles_2019_2020_2021_2022.csv",
+                train_params="",
                 data_set = "train", 
                 )
 
-    FILEPATH = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11B1"
-    #FILEPATH = "/mnt/LOCALDATA/STUDENTS/SATELLITE/MODIS/MOD11A1"
+    FILEPATH = ""
+    #FILEPATH = ""
     LAYERNAMES = ["LST_Day_6km", "LST_Night_6km"]
     #LAYERNAMES = ["LST_Day_1km", "LST_Night_1km"]
     TRAINYEARS = ["2019", "2020", "2021", "2022"]
-    OUTNAME = "train_params_tiles_2019_2020_2021_2022.csv"
-
+    OUTNAME = ""
 
     #data_param_estimation(FILEPATH, LAYERNAMES, TRAINYEARS, OUTNAME)
     """
